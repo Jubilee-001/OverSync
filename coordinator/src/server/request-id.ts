@@ -52,9 +52,16 @@ export function createRequestIdMiddleware(options: { log?: Logger } = {}): Reque
       substituted = true;
     }
 
+    // Publish only the canonical ID to downstream middleware. pino-http runs
+    // after this and logs `req.id` plus the request headers, so replacing the
+    // untrusted header here keeps the HTTP log, warning log and response
+    // header on the same sanitised-or-generated value.
+    req.headers["x-request-id"] = id;
+    (req as Request & { id?: string }).id = id;
+
     if (substituted && log) {
       log.warn(
-        { requestId: id, received: typeof raw === "string" ? raw : undefined },
+        { requestId: id },
         "invalid or missing X-Request-Id; generated safe server id"
       );
     }

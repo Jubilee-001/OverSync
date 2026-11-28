@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import request from "supertest";
 import express from "express";
 import type { NextFunction, Request, Response } from "express";
-import type { Logger } from "pino";
+import pino, { type Logger } from "pino";
+import pinoHttp from "pino-http";
 import {
   createRequestIdMiddleware,
   MAX_REQUEST_ID_LENGTH,
@@ -39,18 +40,43 @@ function mountRequestIdMiddleware(log: Logger) {
   return app;
 }
 
+/** Mirrors createApp's middleware order: request ID first, HTTP logging second. */
+function mountWithHttpLogging(log: Logger) {
+  const app = express();
+  app.use(createRequestIdMiddleware({ log }));
+  app.use(pinoHttp({ logger: log }));
+  app.use((_req, res) => res.status(200).json({ ok: true }));
+  return app;
+}
+
+/** Captures real pino JSON output so the HTTP log payload can be asserted. */
+function makeCapturingLog() {
+  const entries: Array<Record<string, any>> = [];
+  const log = pino(
+    { level: "info" },
+    {
+      write(chunk: string) {
+        entries.push(JSON.parse(chunk));
+      },
+    }
+  );
+  return { log, entries };
+}
+
 /** Invokes the middleware handler directly (bypasses HTTP header validation). */
 function invokeHandler(log: TestLogger, received: string | undefined) {
   const handler = createRequestIdMiddleware({ log });
   const req = { header: () => received } as unknown as Request;
   const headerSet: Record<string, string> = {};
+  const headers: Record<string, string> = {};
+  const reqWithHeaders = { ...req, headers } as unknown as Request;
   const res = {
     setHeader: (key: string, value: string) => {
       headerSet[key.toLowerCase()] = String(value);
     },
   } as unknown as Response;
   let nextCalled = false;
-  handler(req, res, (() => {
+  handler(reqWithHeaders, res, (() => {
     nextCalled = true;
   }) as NextFunction);
   return { headerSet, nextCalled };
@@ -137,9 +163,9 @@ describe("createRequestIdMiddleware", () => {
       expect(headerSet["x-request-id"]!).toBe("traceid");
       expect(log.logs).toHaveLength(1);
       expect(log.logs[0]!.level).toBe("warn");
-      expect(
-        String((log.logs[0]!.obj as { received?: string })?.received)
-      ).toBe("trace\u0001id\u007f");
+      const obj = log.logs[0]!.obj as { requestId?: string; received?: string };
+      expect(obj.requestId).toBe("traceid");
+      expect(obj).not.toHaveProperty("received");
     });
 
     it("generates a safe server id when the value is unusable after sanitisation", () => {
@@ -147,15 +173,54 @@ describe("createRequestIdMiddleware", () => {
       const { headerSet, nextCalled } = invokeHandler(log, "\u0000\u001f");
 
       expect(nextCalled).toBe(true);
-      expect(String(headerSet["x-request-id"]!)).toMatch(
-        /^oversync-[0-9a-f]{16}$/
-      );
+      const id = String(headerSet["x-request-id"]!);
+      expect(id).toMatch(/^oversync-[0-9a-f]{16}$/);
       expect(log.logs).toHaveLength(1);
       expect(log.logs[0]!.level).toBe("warn");
       expect(String(log.logs[0]!.msg)).toContain("generated safe server id");
-      expect(
-        String((log.logs[0]!.obj as { received?: string })?.received)
-      ).toBe("\u0000\u001f");
+      const obj = log.logs[0]!.obj as { requestId?: string; received?: string };
+      expect(obj.requestId).toBe(id);
+      expect(obj).not.toHaveProperty("received");
+    });
+  });
+
+  describe("HTTP request logging", () => {
+    it("logs the generated canonical id shared with the response header", async () => {
+      const { log, entries } = makeCapturingLog();
+      const app = mountWithHttpLogging(log);
+
+      const res = await request(app).get("/").set("x-request-id", "");
+      const id = String(res.headers["x-request-id"]);
+
+      expect(id).toMatch(/^oversync-[0-9a-f]{16}$/);
+      const requestLogs = entries.filter((entry) => entry.req);
+      expect(requestLogs.length).toBeGreaterThan(0);
+      for (const entry of requestLogs) {
+        expect(entry.req.id).toBe(id);
+      }
+      const warning = entries.find(
+        (entry) => entry.level === 40 && entry.requestId
+      );
+      expect(warning?.requestId).toBe(id);
+      expect(warning).not.toHaveProperty("received");
+    });
+
+    it("logs only the truncated id when the client header is oversized", async () => {
+      const { log, entries } = makeCapturingLog();
+      const app = mountWithHttpLogging(log);
+      const raw = "a".repeat(MAX_REQUEST_ID_LENGTH + 72);
+
+      const res = await request(app).get("/").set("x-request-id", raw);
+      const id = String(res.headers["x-request-id"]);
+
+      expect(id).toHaveLength(MAX_REQUEST_ID_LENGTH);
+      const requestLogs = entries.filter((entry) => entry.req);
+      expect(requestLogs.length).toBeGreaterThan(0);
+      for (const entry of requestLogs) {
+        expect(entry.req.id).toBe(id);
+        expect(entry.req.headers["x-request-id"]).toBe(id);
+      }
+      expect(JSON.stringify(entries)).not.toContain(raw);
     });
   });
 
@@ -173,11 +238,15 @@ describe("createRequestIdMiddleware", () => {
       const log = makeLog();
       const app = mountRequestIdMiddleware(log);
 
-      await request(app).get("/").set("x-request-id", "");
+      const res = await request(app).get("/").set("x-request-id", "");
 
       expect(log.logs).toHaveLength(1);
       expect(log.logs[0]!.level).toBe("warn");
       expect(String(log.logs[0]!.msg)).toContain("generated safe server id");
+      expect(
+        (log.logs[0]!.obj as { requestId?: string }).requestId
+      ).toBe(String(res.headers["x-request-id"]));
+      expect(log.logs[0]!.obj).not.toHaveProperty("received");
     });
   });
 });
